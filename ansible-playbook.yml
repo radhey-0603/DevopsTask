@@ -1,0 +1,204 @@
+---
+- name: Provision and Configure Ubuntu VM on AWS
+  hosts: localhost
+  connection: local
+  gather_facts: True
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Launch an EC2 instance
+      amazon.aws.ec2_instance:
+        aws_access_key: "AKIAVOUKG5TERTY64XHI"
+        aws_secret_key: "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"
+        name: "demo-ops"
+        key_name: "demo"
+        instance_type: "t2.micro"
+        image_id: "ami-0310483fb2b488153"   # Replace with your desired Ubuntu AMI ID
+        region: "ap-southeast-2"
+        vpc_subnet_id: "subnet-0b1b431f2453849ee"  # Replace with your desired subnet ID
+        security_group: "sg-0839293f7728bbe76"    # Replace with your desired security group ID
+        tags:
+          Name: demo-ops
+      register: ec2_instance
+    - name: Print public IP address
+      debug:
+        var: ec2_instance.instances[0].public_ip_address
+    - name: Add the EC2 instance to the host group
+      add_host:
+        hostname: "{{ ec2_instance.instances[0].public_ip_address }}"
+        groupname: launched
+
+- name: Configure VM
+  hosts: launched
+  become: yes
+    #  become_user: ubuntu
+  vars:
+    ansible_ssh_private_key_file: /home/ubuntu/ansible/demo.pem 
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: demo-ops
+      tags:
+        - hostname
+      become: yes
+
+    - name: Create user 'demo'
+      user:
+        name: demo
+        state: present
+        groups: sudo  # Add 'demo' to the sudo group for administrative privileges
+      tags:
+        - users
+      become: yes
+    - name: Disable root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify:
+        - Restart SSH
+      become: true
+
+    - name: Install and configure UFW firewall
+      apt:
+        name: ufw
+        state: present
+      become: true
+
+    - name: Start and enable UFW
+      service:
+        name: ufw
+        state: started
+        enabled: yes
+      become: true
+
+    - name: Allow specific ports through UFW
+      command: ufw allow {{ item }}/tcp
+      with_items:
+        - 80  # Example: Open port 80 for HTTP
+        - 443 # Example: Open port 443 for HTTPS
+        - 22
+      notify:
+        - Reload UFW
+      become: true
+
+    - name: Configure sysctl parameters
+      command: sysctl -w {{ item.name }}={{ item.value }}
+      loop:
+       - { name: 'fs.file-max', value: '65535' }
+       - { name: 'vm.swappiness', value: '10' }
+       - { name: 'net.core.somaxconn', value: '65535' }
+      become: true
+
+    - name: Set system timezone to Asia/Kolkata
+      command: timedatectl set-timezone Asia/Kolkata
+      become: yes
+
+    - name: Install docker packages
+      apt:
+       name: "{{ item }}"
+       state: present
+       update_cache: yes
+      with_items:
+       - apt-transport-https
+       - ca-certificates
+       - curl
+       - software-properties-common
+      tags:
+       - docker
+      become: true
+  
+    - name: Add Docker s official GPG key
+      apt_key:
+       url: https://download.docker.com/linux/ubuntu/gpg
+       state: present
+      tags:
+       - docker
+      become: true
+    - name: Verify that we have the key with the fingerprint
+      apt_key:
+       id: 0EBFCD88
+       state: present
+      tags:
+       - docker
+      become: yes
+
+    - name: Set up the stable repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+        state: present
+        update_cache: yes
+      tags:
+      - docker
+      become: yes
+
+    - name: Update apt packages
+      apt:
+       update_cache: yes
+      tags:
+       - docker
+      become: yes
+    - name: Install docker
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+    #notify: Start docker on boot
+      tags:
+       - docker
+      become: yes
+    - name: Configure Docker Daemon Options
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+      notify:
+        - Restart Docker
+      become: yes
+    - name: Install docker-compose
+      get_url:
+         url : https://github.com/docker/compose/releases/download/1.25.1-rc1/docker-compose-Linux-x86_64
+         dest: /usr/local/bin/docker-compose
+         mode: 'u+x,g+x'
+      become: yes
+    - name: Create the destination directory if it doesn't exist
+      file:
+        path: /etc/demo-ops
+        state: directory
+      become: yes 
+    - name: Deploy docker-compose.yml
+      copy:
+        src: /home/ubuntu/ansible/docker-compose.yml
+        dest: /etc/demo-ops/docker-compose.yml
+      become: true
+    - name: Copy the folder
+      copy:
+        src: /home/ubuntu/ansible/myapp
+        dest: /etc/demo-ops
+      become: yes
+
+    - name: Copy the folder
+      copy:
+        src: /home/ubuntu/ansible/nginx
+        dest: /etc/demo-ops
+      become: yes
+
+
+    - name: Start Docker services
+      command: docker-compose -f /etc/demo-ops/docker-compose.yml up -d
+      become: true
+  handlers:
+   - name: Restart SSH
+     service:
+      name: ssh
+      state: restarted
+  handlers:
+   - name: Reload UFW
+     ufw:
+      state: reloaded  
